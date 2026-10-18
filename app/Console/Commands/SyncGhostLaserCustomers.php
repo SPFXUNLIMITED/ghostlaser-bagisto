@@ -89,6 +89,23 @@ class SyncGhostLaserCustomers extends Command
                             throw new RuntimeException('Customer record is not a valid object.');
                         }
 
+                        $firstName = trim((string) ($customer['first_name'] ?? ''));
+                        $lastName = trim((string) ($customer['last_name'] ?? ''));
+                        $phone = trim((string) ($customer['phone'] ?? ''));
+
+                        if ($firstName === '' || $lastName === '' || $phone === '') {
+                            $skipped++;
+                            Log::warning('Skipped broken record', [
+                                'email' => trim((string) ($customer['email'] ?? '')),
+                                'first_name' => $firstName,
+                                'last_name' => $lastName,
+                                'phone' => $phone,
+                            ]);
+                            $this->warn('Skipped broken record: ' . trim((string) ($customer['email'] ?? '')));
+
+                            continue;
+                        }
+
                         $payload = [
                             'first_name' => $customer['first_name'] ?? '',
                             'last_name' => $customer['last_name'] ?? '',
@@ -97,7 +114,6 @@ class SyncGhostLaserCustomers extends Command
                             'customer_group_id' => $customerGroupId,
                         ];
 
-                        $phone = trim((string) ($customer['phone'] ?? ''));
                         if ($phone !== '') {
                             $payload['phone'] = $phone;
                         }
