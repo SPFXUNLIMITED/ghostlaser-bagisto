@@ -15,14 +15,14 @@ class SyncGhostLaserCustomers extends Command
 
     public function handle(): int
     {
-        $apiKey = trim((string) env('BAGISTO_API_KEY'));
+        $apiKey = trim((string) config('ghostlaser.api_key'));
         if ($apiKey === '') {
             $this->error('BAGISTO_API_KEY is not configured.');
 
             return self::FAILURE;
         }
 
-        $adminToken = trim((string) env('BAGISTO_ADMIN_TOKEN'));
+        $adminToken = trim((string) config('ghostlaser.admin_token'));
         if ($adminToken === '') {
             $this->error('BAGISTO_ADMIN_TOKEN is not configured.');
 
@@ -37,7 +37,7 @@ class SyncGhostLaserCustomers extends Command
         $perPage = 100;
         $total = PHP_INT_MAX;
 
-        while ($page * $perPage < $total || $page === 1) {
+        while ($page * $perPage <= $total || $page === 1) {
             try {
                 $url = 'https://ghostlaser.com/spfx_ghostlaser/routes/api/bagisto-customers.php?'
                     . http_build_query([
@@ -76,19 +76,8 @@ class SyncGhostLaserCustomers extends Command
                             'email' => $customer['email'] ?? '',
                             'phone' => $customer['phone'] ?? '',
                             'gender' => 'Other',
+                            'customer_group_id' => 1,
                         ];
-
-                        foreach ([
-                            'city' => 'city',
-                            'state' => 'state',
-                            'zip' => 'postcode',
-                            'country' => 'country',
-                        ] as $sourceField => $targetField) {
-                            $value = $customer[$sourceField] ?? null;
-                            if ($value !== null && trim((string) $value) !== '') {
-                                $payload[$targetField] = $value;
-                            }
-                        }
 
                         $email = trim((string) $payload['email']);
                         $headers = [
@@ -97,48 +86,36 @@ class SyncGhostLaserCustomers extends Command
                         ];
 
                         [$existingBody, $existingStatus] = $this->request(
-                            'https://ghostlaser.com/api/admin/customers?email=' . urlencode($email),
+                            'https://ghostlaser.com/api/admin/customers?'
+                                . http_build_query(['email' => ['eq' => $email]]),
                             'GET',
                             $headers
                         );
 
-						if ($existingStatus === 404) {
-							$exists = false;
-						} else if ($existingStatus < 200 || $existingStatus >= 300) {
-							throw new RuntimeException("Customer lookup returned HTTP {$existingStatus}.");
-						} else {
-							$existingResponse = json_decode($existingBody, true, 512, JSON_THROW_ON_ERROR);
-							if (!is_array($existingResponse) || !isset($existingResponse ) || !is_array($existingResponse )) {
-								throw new RuntimeException('Customer lookup returned an invalid data response.');
-							}
+                        if ($existingStatus === 404) {
+                            $exists = false;
+                        } elseif ($existingStatus < 200 || $existingStatus >= 300) {
+                            throw new RuntimeException("Customer lookup returned HTTP {$existingStatus}.");
+                        } else {
+                            $existingResponse = json_decode($existingBody, true, 512, JSON_THROW_ON_ERROR);
+                            if (!is_array($existingResponse)) {
+                                throw new RuntimeException('Customer lookup returned an invalid data response.');
+                            }
 
-							$exists = false;
-							foreach ($existingResponse as $existingCustomer) {
-								if (
-									is_array($existingCustomer)
-									&&isset($existingCustomer )
-									&& stripos((string) data_get($existingCustomer, 'email', ''), $email) === 0
-								) {
-									$exists = true;
-									break;
-								}
-							}
-						}
+                            $existingCustomers = $existingResponse['data'] ?? $existingResponse;
+                            if (!is_array($existingCustomers)) {
+                                throw new RuntimeException('Customer lookup returned an invalid data response.');
+                            }
 
-                        $existingResponse = json_decode($existingBody, true, 512, JSON_THROW_ON_ERROR);
-                        if (!is_array($existingResponse) || !isset($existingResponse['data']) || !is_array($existingResponse['data'])) {
-                            throw new RuntimeException('Customer lookup returned an invalid data response.');
-                        }
-
-                        $exists = false;
-                        foreach ($existingResponse['data'] as $existingCustomer) {
-                            if (
-                                is_array($existingCustomer)
-                                && isset($existingCustomer['email'])
-                                && strcasecmp((string) $existingCustomer['email'], $email) === 0
-                            ) {
-                                $exists = true;
-                                break;
+                            $exists = false;
+                            foreach ($existingCustomers as $existingCustomer) {
+                                if (
+                                    is_array($existingCustomer)
+                                    && strcasecmp((string) data_get($existingCustomer, 'email', ''), $email) === 0
+                                ) {
+                                    $exists = true;
+                                    break;
+                                }
                             }
                         }
 
@@ -156,18 +133,28 @@ class SyncGhostLaserCustomers extends Command
                         );
 
                         if ($createdStatus < 200 || $createdStatus >= 300) {
-							Log::error('Bagisto 422 body', );
-                            throw new RuntimeException("Customer creation returned HTTP {$createdStatus}.");
+                            if ($this->isDuplicateEmailResponse($createdStatus, $createdBody)) {
+                                $skipped++;
+
+                                continue;
+                            }
+
+                            Log::error('Bagisto customer create failed', [
+                                'email' => $email,
+                                'status' => $createdStatus,
+                                'body' => $createdBody,
+                            ]);
+
+                            throw new RuntimeException(
+                                "Customer creation returned HTTP {$createdStatus}: " . trim($createdBody)
+                            );
                         }
 
                         $created++;
                         Log::info('Ghost Laser customer created in Bagisto.', ['email' => $email]);
                     } catch (Throwable $exception) {
                         $errors++;
-                        Log::error('Failed to sync Ghost Laser customer.', [
-                            'email' => $email,
-                            'exception' => $exception,
-                        ]);
+                        $this->warn($email . ': ' . $exception->getMessage());
                     }
                 }
 
@@ -193,6 +180,15 @@ class SyncGhostLaserCustomers extends Command
         ));
 
         return self::SUCCESS;
+    }
+
+    private function isDuplicateEmailResponse(int $statusCode, string $body): bool
+    {
+        if ($statusCode !== 422) {
+            return false;
+        }
+
+        return stripos($body, 'has already been taken') !== false;
     }
 
     private function request(string $url, string $method, array $headers, ?string $content = null): array
