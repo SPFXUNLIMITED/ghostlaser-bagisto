@@ -29,6 +29,22 @@ class SyncGhostLaserCustomers extends Command
             return self::FAILURE;
         }
 
+        $baseUrl = rtrim(trim((string) config('ghostlaser.bagisto_url')), '/');
+        if ($baseUrl === '') {
+            $this->error('BAGISTO_URL (or APP_URL) is not configured.');
+
+            return self::FAILURE;
+        }
+
+        $sourceUrl = trim((string) config('ghostlaser.source_url'));
+        if ($sourceUrl === '') {
+            $this->error('GHOSTLASER_CUSTOMERS_URL is not configured.');
+
+            return self::FAILURE;
+        }
+
+        $customerGroupId = (int) config('ghostlaser.customer_group_id');
+
         $created = 0;
         $updated = 0;
         $skipped = 0;
@@ -39,7 +55,7 @@ class SyncGhostLaserCustomers extends Command
 
         while ($page * $perPage <= $total || $page === 1) {
             try {
-                $url = 'https://ghostlaser.com/spfx_ghostlaser/routes/api/bagisto-customers.php?'
+                $url = $sourceUrl . '?'
                     . http_build_query([
                         'page' => $page,
                         'per_page' => 100,
@@ -76,57 +92,29 @@ class SyncGhostLaserCustomers extends Command
                             'email' => $customer['email'] ?? '',
                             'phone' => $customer['phone'] ?? '',
                             'gender' => 'Other',
-                            'customer_group_id' => 1,
+                            'customer_group_id' => $customerGroupId,
                         ];
 
                         $email = trim((string) $payload['email']);
+                        if ($email === '') {
+                            throw new RuntimeException('Customer record has no email address.');
+                        }
+
+                        $payload['email'] = $email;
+
                         $headers = [
                             'Authorization' => 'Bearer ' . $adminToken,
                             'Accept' => 'application/json',
                         ];
 
-                        [$existingBody, $existingStatus] = $this->request(
-                            'https://ghostlaser.com/api/admin/customers?'
-                                . http_build_query(['email' => ['eq' => $email]]),
-                            'GET',
-                            $headers
-                        );
-
-                        if ($existingStatus === 404) {
-                            $exists = false;
-                        } elseif ($existingStatus < 200 || $existingStatus >= 300) {
-                            throw new RuntimeException("Customer lookup returned HTTP {$existingStatus}.");
-                        } else {
-                            $existingResponse = json_decode($existingBody, true, 512, JSON_THROW_ON_ERROR);
-                            if (!is_array($existingResponse)) {
-                                throw new RuntimeException('Customer lookup returned an invalid data response.');
-                            }
-
-                            $existingCustomers = $existingResponse['data'] ?? $existingResponse;
-                            if (!is_array($existingCustomers)) {
-                                throw new RuntimeException('Customer lookup returned an invalid data response.');
-                            }
-
-                            $exists = false;
-                            foreach ($existingCustomers as $existingCustomer) {
-                                if (
-                                    is_array($existingCustomer)
-                                    && strcasecmp((string) data_get($existingCustomer, 'email', ''), $email) === 0
-                                ) {
-                                    $exists = true;
-                                    break;
-                                }
-                            }
-                        }
-
-                        if ($exists) {
+                        if ($this->customerExists($baseUrl, $headers, $email)) {
                             $skipped++;
 
                             continue;
                         }
 
                         [$createdBody, $createdStatus] = $this->request(
-                            'https://ghostlaser.com/api/admin/customers',
+                            $baseUrl . '/api/admin/customers',
                             'POST',
                             $headers + ['Content-Type' => 'application/json'],
                             json_encode($payload, JSON_THROW_ON_ERROR)
@@ -146,7 +134,7 @@ class SyncGhostLaserCustomers extends Command
                             ]);
 
                             throw new RuntimeException(
-                                "Customer creation returned HTTP {$createdStatus}: " . trim($createdBody)
+                                "Customer creation returned HTTP {$createdStatus}: " . $this->truncate($createdBody)
                             );
                         }
 
@@ -180,6 +168,78 @@ class SyncGhostLaserCustomers extends Command
         ));
 
         return self::SUCCESS;
+    }
+
+    /**
+     * Check whether a customer with the given email already exists in Bagisto.
+     *
+     * The admin API filters customers with `?email=` as a partial (LIKE) match,
+     * so results are compared exactly here. Array-shaped parameters such as
+     * `email[eq]=` must not be used: Bagisto concatenates the raw value into the
+     * LIKE pattern, and the resulting "Array to string conversion" is escalated
+     * to an exception by Laravel, which is returned as HTTP 500.
+     *
+     * When the lookup itself fails the sync falls through to the create call,
+     * which is still protected by the unique email validation (HTTP 422).
+     */
+    private function customerExists(string $baseUrl, array $headers, string $email): bool
+    {
+        $url = $baseUrl . '/api/admin/customers?' . http_build_query([
+            'email' => $email,
+            'page' => 1,
+            'per_page' => 50,
+        ]);
+
+        [$body, $status] = $this->request($url, 'GET', $headers);
+
+        if ($status === 404) {
+            return false;
+        }
+
+        if ($status < 200 || $status >= 300) {
+            Log::warning('Bagisto customer lookup failed', [
+                'email' => $email,
+                'status' => $status,
+                'body' => $this->truncate($body),
+            ]);
+
+            $this->warn(sprintf(
+                '%s: customer lookup returned HTTP %d (%s); falling back to create.',
+                $email,
+                $status,
+                $this->truncate($body)
+            ));
+
+            return false;
+        }
+
+        $response = json_decode($body, true, 512, JSON_THROW_ON_ERROR);
+        if (!is_array($response)) {
+            throw new RuntimeException('Customer lookup returned an invalid data response.');
+        }
+
+        $customers = $response['data'] ?? $response;
+        if (!is_array($customers)) {
+            throw new RuntimeException('Customer lookup returned an invalid data response.');
+        }
+
+        foreach ($customers as $customer) {
+            if (
+                is_array($customer)
+                && strcasecmp((string) data_get($customer, 'email', ''), $email) === 0
+            ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function truncate(string $body, int $length = 500): string
+    {
+        $body = trim($body);
+
+        return strlen($body) > $length ? substr($body, 0, $length) . '…' : $body;
     }
 
     private function isDuplicateEmailResponse(int $statusCode, string $body): bool
