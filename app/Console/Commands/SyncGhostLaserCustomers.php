@@ -93,10 +93,14 @@ class SyncGhostLaserCustomers extends Command
                             'first_name' => $customer['first_name'] ?? '',
                             'last_name' => $customer['last_name'] ?? '',
                             'email' => $customer['email'] ?? '',
-                            'phone' => $customer['phone'] ?? '',
                             'gender' => 'Other',
                             'customer_group_id' => $customerGroupId,
                         ];
+
+                        $phone = trim((string) ($customer['phone'] ?? ''));
+                        if ($phone !== '') {
+                            $payload['phone'] = $phone;
+                        }
 
                         $email = trim((string) $payload['email']);
                         if ($email === '') {
