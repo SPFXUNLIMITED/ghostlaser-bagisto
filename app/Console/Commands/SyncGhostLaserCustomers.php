@@ -43,7 +43,10 @@ class SyncGhostLaserCustomers extends Command
             return self::FAILURE;
         }
 
-        $customerGroupId = (int) config('ghostlaser.customer_group_id');
+        $customerGroupId = (int) config('ghostlaser.customer_group_id', 1);
+        if ($customerGroupId < 1) {
+            $customerGroupId = 1;
+        }
 
         $created = 0;
         $updated = 0;

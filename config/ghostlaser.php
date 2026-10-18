@@ -35,8 +35,8 @@ return [
 
     /*
     | Customer group assigned to synced customers. Bagisto seeds 1 = guest,
-    | 2 = general, 3 = wholesale, so registered customers belong in group 2.
+    | 2 = general, 3 = wholesale; imported customers default to guest.
     */
 
-    'customer_group_id' => (int) env('GHOSTLASER_CUSTOMER_GROUP_ID', 2),
+    'customer_group_id' => (int) env('GHOSTLASER_CUSTOMER_GROUP_ID', 1),
 ];
