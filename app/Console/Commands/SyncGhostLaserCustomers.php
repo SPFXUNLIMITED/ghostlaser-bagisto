@@ -376,7 +376,7 @@ class SyncGhostLaserCustomers extends Command
      */
     private function normalizePhone(string $phone): string
     {
-        return trim(preg_replace('/[-\s()]/', '', $phone) ?? '');
+        return trim(preg_replace("/[-\s()\xC2\xA0]+/u", '', $phone) ?? '');
     }
 
     /**
