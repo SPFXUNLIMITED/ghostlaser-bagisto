@@ -299,11 +299,9 @@ class SyncGhostLaserCustomers extends Command
         string $email,
         array $customer
     ): ?bool {
-        $street = trim((string) ($customer['street'] ?? $customer['address'] ?? ''));
-        $city = trim((string) ($customer['city'] ?? ''));
-        $postcode = trim((string) ($customer['zip'] ?? ''));
+        $address = trim((string) ($customer['address'] ?? ''));
 
-        if ($street === '' || $city === '' || $postcode === '') {
+        if ($address === '') {
             Log::info('Skipped Bagisto address: source record has no address.', [
                 'email' => $email,
                 'customer_id' => $customerId,
@@ -314,15 +312,30 @@ class SyncGhostLaserCustomers extends Command
         }
 
         $payload = [
-            'first_name' => $customer['first_name'] ?? '',
-            'last_name' => $customer['last_name'] ?? '',
-            'address' => $street,
-            'city' => $city,
-            'country' => 'US',
-            'postcode' => $postcode,
-            'phone' => trim((string) ($customer['phone'] ?? '')),
+            'customer_id' => $customerId,
+            'address_type' => 'customer',
+            'address' => $address,
             'default_address' => true,
+            'use_for_shipping' => true,
         ];
+
+        $optional = [
+            'first_name' => trim((string) ($customer['first_name'] ?? '')),
+            'last_name' => trim((string) ($customer['last_name'] ?? '')),
+            'company_name' => trim((string) ($customer['company'] ?? '')),
+            'city' => trim((string) ($customer['city'] ?? '')),
+            'state' => trim((string) ($customer['state'] ?? '')),
+            'postcode' => trim((string) ($customer['zip'] ?? '')),
+            'country' => trim((string) ($customer['country'] ?? '')),
+            'email' => trim((string) ($customer['email'] ?? $email)),
+            'phone' => trim((string) ($customer['phone'] ?? '')),
+        ];
+
+        foreach ($optional as $key => $value) {
+            if ($value !== '') {
+                $payload[$key] = $value;
+            }
+        }
 
         [$body, $status] = $this->request(
             $baseUrl . '/api/admin/customers/' . $customerId . '/addresses',
