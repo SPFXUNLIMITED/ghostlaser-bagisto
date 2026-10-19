@@ -168,6 +168,26 @@ class SyncGhostLaserCustomers extends Command
                             json_encode($payload, JSON_THROW_ON_ERROR)
                         );
 
+                        if (
+                            isset($payload['phone'])
+                            && $this->isDuplicatePhoneResponse($createdStatus, $createdBody)
+                        ) {
+                            Log::warning('Bagisto customer phone already in use; retrying without phone.', [
+                                'email' => $email,
+                                'phone' => $payload['phone'],
+                            ]);
+                            $this->warn($email . ': phone already used by another customer, creating without phone.');
+
+                            unset($payload['phone']);
+
+                            [$createdBody, $createdStatus] = $this->request(
+                                $baseUrl . '/api/admin/customers',
+                                'POST',
+                                $headers + ['Content-Type' => 'application/json'],
+                                json_encode($payload, JSON_THROW_ON_ERROR)
+                            );
+                        }
+
                         if ($createdStatus < 200 || $createdStatus >= 300) {
                             if ($this->isDuplicateEmailResponse($createdStatus, $createdBody)) {
                                 $skipped++;
@@ -311,30 +331,51 @@ class SyncGhostLaserCustomers extends Command
             return null;
         }
 
-        $payload = [
+        $country = trim((string) ($customer['country'] ?? ''));
+        if ($country === '') {
+            $country = trim((string) config('ghostlaser.default_country', 'US'));
+        }
+
+        $fields = [
+            'first_name' => trim((string) ($customer['first_name'] ?? '')),
+            'last_name' => trim((string) ($customer['last_name'] ?? '')),
+            'city' => trim((string) ($customer['city'] ?? '')),
+            'state' => trim((string) ($customer['state'] ?? '')),
+            'postcode' => trim((string) ($customer['zip'] ?? '')),
+            'country' => $country,
+            'phone' => trim((string) ($customer['phone'] ?? '')),
+        ];
+
+        // Bagisto validates all of these as required, so an incomplete source
+        // record can only produce an HTTP 422. Skip it instead of calling.
+        $missing = array_keys(array_filter($fields, static fn ($value): bool => $value === ''));
+        if ($missing !== []) {
+            Log::info('Skipped Bagisto address: source record is incomplete.', [
+                'email' => $email,
+                'customer_id' => $customerId,
+                'missing' => $missing,
+            ]);
+            $this->line(sprintf(
+                '%s: incomplete source address (missing %s), address call skipped.',
+                $email,
+                implode(', ', $missing)
+            ));
+
+            return null;
+        }
+
+        $payload = $fields + [
             'customer_id' => $customerId,
             'address_type' => 'customer',
             'address' => $address,
             'default_address' => true,
             'use_for_shipping' => true,
+            'email' => trim((string) ($customer['email'] ?? '')) ?: $email,
         ];
 
-        $optional = [
-            'first_name' => trim((string) ($customer['first_name'] ?? '')),
-            'last_name' => trim((string) ($customer['last_name'] ?? '')),
-            'company_name' => trim((string) ($customer['company'] ?? '')),
-            'city' => trim((string) ($customer['city'] ?? '')),
-            'state' => trim((string) ($customer['state'] ?? '')),
-            'postcode' => trim((string) ($customer['zip'] ?? '')),
-            'country' => trim((string) ($customer['country'] ?? '')),
-            'email' => trim((string) ($customer['email'] ?? $email)),
-            'phone' => trim((string) ($customer['phone'] ?? '')),
-        ];
-
-        foreach ($optional as $key => $value) {
-            if ($value !== '') {
-                $payload[$key] = $value;
-            }
+        $company = trim((string) ($customer['company'] ?? ''));
+        if ($company !== '') {
+            $payload['company_name'] = $company;
         }
 
         [$body, $status] = $this->request(
@@ -506,6 +547,27 @@ class SyncGhostLaserCustomers extends Command
         }
 
         return stripos($body, 'has already been taken') !== false;
+    }
+
+    /**
+     * Detect a create failure caused by the unique phone constraint.
+     *
+     * Bagisto does not validate the phone for uniqueness, so a reused phone
+     * surfaces as an HTTP 500 from the `customers_phone_unique` index.
+     */
+    private function isDuplicatePhoneResponse(int $statusCode, string $body): bool
+    {
+        if ($statusCode < 400) {
+            return false;
+        }
+
+        if (stripos($body, 'customers_phone_unique') !== false) {
+            return true;
+        }
+
+        return $statusCode === 422
+            && stripos($body, 'phone') !== false
+            && stripos($body, 'has already been taken') !== false;
     }
 
     private function request(string $url, string $method, array $headers, ?string $content = null): array

@@ -39,4 +39,12 @@ return [
     */
 
     'customer_group_id' => (int) env('GHOSTLASER_CUSTOMER_GROUP_ID', 1),
+
+    /*
+    | Country code used for synced addresses when the source record has no
+    | country. Bagisto validates the address country as a required field, and
+    | the booking database stores US addresses without an explicit country.
+    */
+
+    'default_country' => env('GHOSTLASER_DEFAULT_COUNTRY', 'US'),
 ];
