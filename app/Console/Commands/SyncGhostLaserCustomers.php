@@ -9,7 +9,8 @@ use Throwable;
 
 class SyncGhostLaserCustomers extends Command
 {
-    protected $signature = 'ghostlaser:sync-customers';
+    protected $signature = 'ghostlaser:sync-customers
+        {--backfill : After the sync loop, create a default address for already existing customers that have none}';
 
     protected $description = 'Sync customers from the external Ghost Laser booking database into Bagisto via the Admin REST API.';
 
@@ -48,10 +49,19 @@ class SyncGhostLaserCustomers extends Command
             $customerGroupId = 1;
         }
 
+        $backfill = (bool) $this->option('backfill');
+
         $created = 0;
         $updated = 0;
         $skipped = 0;
         $errors = 0;
+        $addressesCreated = 0;
+        $addressesSkipped = 0;
+        $addressErrors = 0;
+
+        /** @var array<int, array{id: int, email: string, customer: array<string, mixed>}> $backfillQueue */
+        $backfillQueue = [];
+
         $page = 1;
         $perPage = 100;
         $total = PHP_INT_MAX;
@@ -130,8 +140,23 @@ class SyncGhostLaserCustomers extends Command
                             'Accept' => 'application/json',
                         ];
 
-                        if ($this->customerExists($baseUrl, $headers, $email)) {
+                        if (($existingId = $this->findCustomerId($baseUrl, $headers, $email)) !== null) {
                             $skipped++;
+
+                            if ($backfill) {
+                                if ($existingId > 0) {
+                                    $backfillQueue[] = [
+                                        'id' => $existingId,
+                                        'email' => $email,
+                                        'customer' => $customer,
+                                    ];
+                                } else {
+                                    $addressesSkipped++;
+                                    Log::warning('Bagisto customer lookup returned no id; address backfill skipped.', [
+                                        'email' => $email,
+                                    ]);
+                                }
+                            }
 
                             continue;
                         }
@@ -163,6 +188,26 @@ class SyncGhostLaserCustomers extends Command
 
                         $created++;
                         Log::info('Ghost Laser customer created in Bagisto.', ['email' => $email]);
+
+                        $customerId = $this->extractCustomerId($createdBody);
+                        if ($customerId === null) {
+                            $addressesSkipped++;
+                            Log::warning('Bagisto customer create response had no customer id; address skipped.', [
+                                'email' => $email,
+                                'body' => $this->truncate($createdBody),
+                            ]);
+
+                            continue;
+                        }
+
+                        $result = $this->createDefaultAddress($baseUrl, $headers, $customerId, $email, $customer);
+                        if ($result === true) {
+                            $addressesCreated++;
+                        } elseif ($result === false) {
+                            $addressErrors++;
+                        } else {
+                            $addressesSkipped++;
+                        }
                     } catch (Throwable $exception) {
                         $errors++;
                         $this->warn($email . ': ' . $exception->getMessage());
@@ -182,6 +227,47 @@ class SyncGhostLaserCustomers extends Command
             }
         }
 
+        if ($backfill && $backfillQueue !== []) {
+            $adminHeaders = [
+                'Authorization' => 'Bearer ' . $adminToken,
+                'Accept' => 'application/json',
+            ];
+
+            foreach ($backfillQueue as $entry) {
+                try {
+                    if ($this->hasAddresses($baseUrl, $adminHeaders, $entry['id'], $entry['email'])) {
+                        $addressesSkipped++;
+
+                        continue;
+                    }
+
+                    $result = $this->createDefaultAddress(
+                        $baseUrl,
+                        $adminHeaders,
+                        $entry['id'],
+                        $entry['email'],
+                        $entry['customer']
+                    );
+
+                    if ($result === true) {
+                        $addressesCreated++;
+                    } elseif ($result === false) {
+                        $addressErrors++;
+                    } else {
+                        $addressesSkipped++;
+                    }
+                } catch (Throwable $exception) {
+                    $addressErrors++;
+                    Log::error('Bagisto address backfill failed', [
+                        'email' => $entry['email'],
+                        'customer_id' => $entry['id'],
+                        'message' => $exception->getMessage(),
+                    ]);
+                    $this->warn($entry['email'] . ': address backfill failed: ' . $exception->getMessage());
+                }
+            }
+        }
+
         $this->line(sprintf(
             'Sync complete: created %d, updated %d, skipped %d, errors %d.',
             $created,
@@ -190,11 +276,144 @@ class SyncGhostLaserCustomers extends Command
             $errors
         ));
 
+        $this->line(sprintf(
+            'Addresses: created %d, skipped %d, errors %d.',
+            $addressesCreated,
+            $addressesSkipped,
+            $addressErrors
+        ));
+
         return self::SUCCESS;
     }
 
     /**
-     * Check whether a customer with the given email already exists in Bagisto.
+     * Create the default address for a Bagisto customer from the source record.
+     *
+     * Returns true when the address was created, false when the API call
+     * failed, and null when the source record has no usable address.
+     */
+    private function createDefaultAddress(
+        string $baseUrl,
+        array $headers,
+        int $customerId,
+        string $email,
+        array $customer
+    ): ?bool {
+        $street = trim((string) ($customer['street'] ?? $customer['address'] ?? ''));
+        $city = trim((string) ($customer['city'] ?? ''));
+        $postcode = trim((string) ($customer['zip'] ?? ''));
+
+        if ($street === '' || $city === '' || $postcode === '') {
+            Log::info('Skipped Bagisto address: source record has no address.', [
+                'email' => $email,
+                'customer_id' => $customerId,
+            ]);
+            $this->line($email . ': no source address, address call skipped.');
+
+            return null;
+        }
+
+        $payload = [
+            'first_name' => $customer['first_name'] ?? '',
+            'last_name' => $customer['last_name'] ?? '',
+            'address' => $street,
+            'city' => $city,
+            'country' => 'US',
+            'postcode' => $postcode,
+            'phone' => trim((string) ($customer['phone'] ?? '')),
+            'default_address' => true,
+        ];
+
+        [$body, $status] = $this->request(
+            $baseUrl . '/api/admin/customers/' . $customerId . '/addresses',
+            'POST',
+            $headers + ['Content-Type' => 'application/json'],
+            json_encode($payload, JSON_THROW_ON_ERROR)
+        );
+
+        if ($status < 200 || $status >= 300) {
+            Log::error('Bagisto customer address create failed', [
+                'email' => $email,
+                'customer_id' => $customerId,
+                'status' => $status,
+                'body' => $this->truncate($body),
+            ]);
+            $this->warn(sprintf(
+                '%s: address create returned HTTP %d (%s).',
+                $email,
+                $status,
+                $this->truncate($body)
+            ));
+
+            return false;
+        }
+
+        Log::info('Ghost Laser customer address created in Bagisto.', [
+            'email' => $email,
+            'customer_id' => $customerId,
+        ]);
+
+        return true;
+    }
+
+    /**
+     * Check whether a Bagisto customer already has at least one address.
+     */
+    private function hasAddresses(string $baseUrl, array $headers, int $customerId, string $email): bool
+    {
+        [$body, $status] = $this->request(
+            $baseUrl . '/api/admin/customers/' . $customerId . '/addresses',
+            'GET',
+            $headers
+        );
+
+        if ($status === 404) {
+            return false;
+        }
+
+        if ($status < 200 || $status >= 300) {
+            Log::warning('Bagisto customer address lookup failed', [
+                'email' => $email,
+                'customer_id' => $customerId,
+                'status' => $status,
+                'body' => $this->truncate($body),
+            ]);
+
+            throw new RuntimeException("Address lookup returned HTTP {$status}.");
+        }
+
+        $response = json_decode($body, true, 512, JSON_THROW_ON_ERROR);
+        if (!is_array($response)) {
+            throw new RuntimeException('Address lookup returned an invalid data response.');
+        }
+
+        $addresses = $response['data'] ?? $response;
+
+        return is_array($addresses) && $addresses !== [];
+    }
+
+    /**
+     * Pull the customer id out of a Bagisto customer create response.
+     */
+    private function extractCustomerId(string $body): ?int
+    {
+        try {
+            $response = json_decode($body, true, 512, JSON_THROW_ON_ERROR);
+        } catch (Throwable $exception) {
+            return null;
+        }
+
+        if (!is_array($response)) {
+            return null;
+        }
+
+        $id = data_get($response, 'data.id', data_get($response, 'id'));
+
+        return is_numeric($id) ? (int) $id : null;
+    }
+
+    /**
+     * Look up the id of the customer with the given email in Bagisto.
      *
      * The admin API filters customers with `?email=` as a partial (LIKE) match,
      * so results are compared exactly here. Array-shaped parameters such as
@@ -205,7 +424,7 @@ class SyncGhostLaserCustomers extends Command
      * When the lookup itself fails the sync falls through to the create call,
      * which is still protected by the unique email validation (HTTP 422).
      */
-    private function customerExists(string $baseUrl, array $headers, string $email): bool
+    private function findCustomerId(string $baseUrl, array $headers, string $email): ?int
     {
         $url = $baseUrl . '/api/admin/customers?' . http_build_query([
             'email' => $email,
@@ -216,7 +435,7 @@ class SyncGhostLaserCustomers extends Command
         [$body, $status] = $this->request($url, 'GET', $headers);
 
         if ($status === 404) {
-            return false;
+            return null;
         }
 
         if ($status < 200 || $status >= 300) {
@@ -233,7 +452,7 @@ class SyncGhostLaserCustomers extends Command
                 $this->truncate($body)
             ));
 
-            return false;
+            return null;
         }
 
         $response = json_decode($body, true, 512, JSON_THROW_ON_ERROR);
@@ -251,11 +470,13 @@ class SyncGhostLaserCustomers extends Command
                 is_array($customer)
                 && strcasecmp((string) data_get($customer, 'email', ''), $email) === 0
             ) {
-                return true;
+                $id = data_get($customer, 'id');
+
+                return is_numeric($id) ? (int) $id : 0;
             }
         }
 
-        return false;
+        return null;
     }
 
     private function truncate(string $body, int $length = 500): string
