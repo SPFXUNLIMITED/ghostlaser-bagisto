@@ -75,7 +75,7 @@ try {
     $total = (int) $pdo->query("SELECT COUNT(*) FROM customers WHERE {$where}")->fetchColumn();
     $stmt = $pdo->prepare("
         SELECT id AS booking_customer_id, first_name, last_name, email, phone,
-               company, city, state, zip, country, machine_brand, machine_model, machine_watts
+               company, address, city, state, zip, country, machine_brand, machine_model, machine_watts
         FROM customers
         WHERE {$where}
         ORDER BY id
