@@ -67,7 +67,7 @@ class SyncGhostLaserCustomers extends Command
         /** @var array<int, array{id: int, email: string, customer: array<string, mixed>}> $backfillQueue */
         $backfillQueue = [];
 
-        /** @var array<int, array{id: int, email: string}> $phoneBackfillQueue */
+        /** @var array<int, array{id: int, email: string, customer: array<string, mixed>}> $phoneBackfillQueue */
         $phoneBackfillQueue = [];
 
         $page = 1;
@@ -113,13 +113,41 @@ class SyncGhostLaserCustomers extends Command
 
                         if ($firstName === '' || $lastName === '' || $phone === '') {
                             $skipped++;
+                            $brokenEmail = trim((string) ($customer['email'] ?? ''));
                             Log::warning('Skipped broken record', [
-                                'email' => trim((string) ($customer['email'] ?? '')),
+                                'email' => $brokenEmail,
                                 'first_name' => $firstName,
                                 'last_name' => $lastName,
                                 'phone' => $phone,
                             ]);
-                            $this->warn('Skipped broken record: ' . trim((string) ($customer['email'] ?? '')));
+                            $this->warn('Skipped broken record: ' . $brokenEmail);
+
+                            // The record cannot be created, but an existing
+                            // Bagisto customer may still be completed from it.
+                            if (($backfill || $backfillPhones) && $brokenEmail !== '') {
+                                $brokenId = $this->findCustomerId($baseUrl, [
+                                    'Authorization' => 'Bearer ' . $adminToken,
+                                    'Accept' => 'application/json',
+                                ], $brokenEmail);
+
+                                if ($brokenId !== null && $brokenId > 0) {
+                                    if ($backfill) {
+                                        $backfillQueue[] = [
+                                            'id' => $brokenId,
+                                            'email' => $brokenEmail,
+                                            'customer' => $customer,
+                                        ];
+                                    }
+
+                                    if ($backfillPhones && $phone !== '') {
+                                        $phoneBackfillQueue[] = [
+                                            'id' => $brokenId,
+                                            'email' => $brokenEmail,
+                                            'customer' => $customer,
+                                        ];
+                                    }
+                                }
+                            }
 
                             continue;
                         }
@@ -171,6 +199,7 @@ class SyncGhostLaserCustomers extends Command
                                     $phoneBackfillQueue[] = [
                                         'id' => $existingId,
                                         'email' => $email,
+                                        'customer' => $customer,
                                     ];
                                 } else {
                                     $phonesSkipped++;
@@ -322,7 +351,9 @@ class SyncGhostLaserCustomers extends Command
                         $baseUrl,
                         $adminHeaders,
                         $entry['id'],
-                        $entry['email']
+                        $entry['email'],
+                        $entry['customer'],
+                        $customerGroupId
                     );
 
                     if ($result === true) {
@@ -380,7 +411,12 @@ class SyncGhostLaserCustomers extends Command
     }
 
     /**
-     * Normalize the phone already stored on a Bagisto customer.
+     * Normalize the phone stored on a Bagisto customer, falling back to the
+     * phone of the source record when Bagisto has none.
+     *
+     * The Bagisto record of an imported customer is frequently incomplete, so
+     * the fields the update endpoint validates as required are taken from the
+     * source record whenever Bagisto has no value for them.
      *
      * Returns true when the customer was updated, false when the API call
      * failed, and null when there is nothing to change.
@@ -389,7 +425,9 @@ class SyncGhostLaserCustomers extends Command
         string $baseUrl,
         array $headers,
         int $customerId,
-        string $email
+        string $email,
+        array $source = [],
+        int $defaultCustomerGroupId = 1
     ): ?bool {
         [$body, $status] = $this->request(
             $baseUrl . '/api/admin/customers/' . $customerId,
@@ -422,30 +460,38 @@ class SyncGhostLaserCustomers extends Command
         $currentPhone = (string) data_get($customer, 'phone', '');
         $normalized = $this->normalizePhone($currentPhone);
 
+        // Bagisto may hold no phone at all for an imported customer, in which
+        // case the phone of the source record is the one to write.
+        if ($normalized === '') {
+            $normalized = $this->normalizePhone((string) ($source['phone'] ?? ''));
+        }
+
         if ($normalized === '' || $normalized === $currentPhone) {
             return null;
         }
 
-        $firstName = trim((string) data_get($customer, 'first_name', ''));
-        $lastName = trim((string) data_get($customer, 'last_name', ''));
-        $customerEmail = trim((string) data_get($customer, 'email', ''));
-        $gender = trim((string) data_get($customer, 'gender', ''));
+        $firstName = trim((string) data_get($customer, 'first_name', ''))
+            ?: trim((string) ($source['first_name'] ?? ''));
+        $lastName = trim((string) data_get($customer, 'last_name', ''))
+            ?: trim((string) ($source['last_name'] ?? ''));
+        $customerEmail = trim((string) data_get($customer, 'email', ''))
+            ?: trim((string) ($source['email'] ?? '')) ?: $email;
+        $gender = trim((string) data_get($customer, 'gender', '')) ?: 'Other';
         $customerGroupId = data_get($customer, 'customer_group_id', data_get($customer, 'group.id'));
+
+        if (!is_numeric($customerGroupId)) {
+            $customerGroupId = $defaultCustomerGroupId;
+        }
 
         $missing = [];
         foreach ([
             'first_name' => $firstName,
             'last_name' => $lastName,
             'email' => $customerEmail,
-            'gender' => $gender,
         ] as $field => $value) {
             if ($value === '') {
                 $missing[] = $field;
             }
-        }
-
-        if (!is_numeric($customerGroupId)) {
-            $missing[] = 'customer_group_id';
         }
 
         if ($missing !== []) {
@@ -464,6 +510,8 @@ class SyncGhostLaserCustomers extends Command
             return null;
         }
 
+        $status = data_get($customer, 'status');
+
         $payload = [
             'first_name' => $firstName,
             'last_name' => $lastName,
@@ -471,6 +519,9 @@ class SyncGhostLaserCustomers extends Command
             'gender' => $gender,
             'customer_group_id' => (int) $customerGroupId,
             'phone' => $normalized,
+            // The update endpoint defaults the status to 0 when it is absent,
+            // so it has to be sent back to keep the customer enabled.
+            'status' => is_numeric($status) ? (int) $status : 1,
         ];
 
         [$updateBody, $updateStatus] = $this->request(
@@ -481,6 +532,22 @@ class SyncGhostLaserCustomers extends Command
         );
 
         if ($updateStatus < 200 || $updateStatus >= 300) {
+            if ($this->isDuplicatePhoneResponse($updateStatus, $updateBody)) {
+                Log::warning('Bagisto customer phone already in use; phone backfill skipped.', [
+                    'email' => $email,
+                    'customer_id' => $customerId,
+                    'phone' => $normalized,
+                ]);
+                $this->warn(sprintf(
+                    'Customer %d (%s): phone %s already used by another customer, skipped.',
+                    $customerId,
+                    $email,
+                    $normalized
+                ));
+
+                return null;
+            }
+
             Log::error('Bagisto customer phone update failed', [
                 'email' => $email,
                 'customer_id' => $customerId,
