@@ -10,7 +10,8 @@ use Throwable;
 class SyncGhostLaserCustomers extends Command
 {
     protected $signature = 'ghostlaser:sync-customers
-        {--backfill : After the sync loop, create a default address for already existing customers that have none}';
+        {--backfill : After the sync loop, create a default address for already existing customers that have none}
+        {--backfill-phones : After the sync loop, normalize the stored phone of already existing customers}';
 
     protected $description = 'Sync customers from the external Ghost Laser booking database into Bagisto via the Admin REST API.';
 
@@ -50,6 +51,7 @@ class SyncGhostLaserCustomers extends Command
         }
 
         $backfill = (bool) $this->option('backfill');
+        $backfillPhones = (bool) $this->option('backfill-phones');
 
         $created = 0;
         $updated = 0;
@@ -58,9 +60,15 @@ class SyncGhostLaserCustomers extends Command
         $addressesCreated = 0;
         $addressesSkipped = 0;
         $addressErrors = 0;
+        $phonesUpdated = 0;
+        $phonesSkipped = 0;
+        $phoneErrors = 0;
 
         /** @var array<int, array{id: int, email: string, customer: array<string, mixed>}> $backfillQueue */
         $backfillQueue = [];
+
+        /** @var array<int, array{id: int, email: string}> $phoneBackfillQueue */
+        $phoneBackfillQueue = [];
 
         $page = 1;
         $perPage = 100;
@@ -101,7 +109,7 @@ class SyncGhostLaserCustomers extends Command
 
                         $firstName = trim((string) ($customer['first_name'] ?? ''));
                         $lastName = trim((string) ($customer['last_name'] ?? ''));
-                        $phone = trim((string) ($customer['phone'] ?? ''));
+                        $phone = $this->normalizePhone((string) ($customer['phone'] ?? ''));
 
                         if ($firstName === '' || $lastName === '' || $phone === '') {
                             $skipped++;
@@ -153,6 +161,20 @@ class SyncGhostLaserCustomers extends Command
                                 } else {
                                     $addressesSkipped++;
                                     Log::warning('Bagisto customer lookup returned no id; address backfill skipped.', [
+                                        'email' => $email,
+                                    ]);
+                                }
+                            }
+
+                            if ($backfillPhones) {
+                                if ($existingId > 0) {
+                                    $phoneBackfillQueue[] = [
+                                        'id' => $existingId,
+                                        'email' => $email,
+                                    ];
+                                } else {
+                                    $phonesSkipped++;
+                                    Log::warning('Bagisto customer lookup returned no id; phone backfill skipped.', [
                                         'email' => $email,
                                     ]);
                                 }
@@ -288,6 +310,40 @@ class SyncGhostLaserCustomers extends Command
             }
         }
 
+        if ($backfillPhones && $phoneBackfillQueue !== []) {
+            $adminHeaders = [
+                'Authorization' => 'Bearer ' . $adminToken,
+                'Accept' => 'application/json',
+            ];
+
+            foreach ($phoneBackfillQueue as $entry) {
+                try {
+                    $result = $this->backfillCustomerPhone(
+                        $baseUrl,
+                        $adminHeaders,
+                        $entry['id'],
+                        $entry['email']
+                    );
+
+                    if ($result === true) {
+                        $phonesUpdated++;
+                    } elseif ($result === false) {
+                        $phoneErrors++;
+                    } else {
+                        $phonesSkipped++;
+                    }
+                } catch (Throwable $exception) {
+                    $phoneErrors++;
+                    Log::error('Bagisto phone backfill failed', [
+                        'email' => $entry['email'],
+                        'customer_id' => $entry['id'],
+                        'message' => $exception->getMessage(),
+                    ]);
+                    $this->warn($entry['email'] . ': phone backfill failed: ' . $exception->getMessage());
+                }
+            }
+        }
+
         $this->line(sprintf(
             'Sync complete: created %d, updated %d, skipped %d, errors %d.',
             $created,
@@ -303,7 +359,120 @@ class SyncGhostLaserCustomers extends Command
             $addressErrors
         ));
 
+        if ($backfillPhones) {
+            $this->line(sprintf(
+                'Phones: updated %d, skipped %d, errors %d.',
+                $phonesUpdated,
+                $phonesSkipped,
+                $phoneErrors
+            ));
+        }
+
         return self::SUCCESS;
+    }
+
+    /**
+     * Strip formatting characters from a phone number.
+     */
+    private function normalizePhone(string $phone): string
+    {
+        return trim(preg_replace('/[-\s()]/', '', $phone) ?? '');
+    }
+
+    /**
+     * Normalize the phone already stored on a Bagisto customer.
+     *
+     * Returns true when the customer was updated, false when the API call
+     * failed, and null when there is nothing to change.
+     */
+    private function backfillCustomerPhone(
+        string $baseUrl,
+        array $headers,
+        int $customerId,
+        string $email
+    ): ?bool {
+        [$body, $status] = $this->request(
+            $baseUrl . '/api/admin/customers/' . $customerId,
+            'GET',
+            $headers
+        );
+
+        if ($status < 200 || $status >= 300) {
+            Log::warning('Bagisto customer fetch failed during phone backfill', [
+                'email' => $email,
+                'customer_id' => $customerId,
+                'status' => $status,
+                'body' => $this->truncate($body),
+            ]);
+
+            throw new RuntimeException("Customer fetch returned HTTP {$status}.");
+        }
+
+        $response = json_decode($body, true, 512, JSON_THROW_ON_ERROR);
+        if (!is_array($response)) {
+            throw new RuntimeException('Customer fetch returned an invalid data response.');
+        }
+
+        $customer = $response['data'] ?? $response;
+        if (!is_array($customer)) {
+            throw new RuntimeException('Customer fetch returned an invalid data response.');
+        }
+
+        $currentPhone = (string) data_get($customer, 'phone', '');
+        $normalized = $this->normalizePhone($currentPhone);
+
+        if ($normalized === '' || $normalized === $currentPhone) {
+            return null;
+        }
+
+        $payload = [
+            'first_name' => (string) data_get($customer, 'first_name', ''),
+            'last_name' => (string) data_get($customer, 'last_name', ''),
+            'email' => (string) data_get($customer, 'email', $email),
+            'phone' => $normalized,
+        ];
+
+        $gender = (string) data_get($customer, 'gender', '');
+        if ($gender !== '') {
+            $payload['gender'] = $gender;
+        }
+
+        $customerGroupId = data_get($customer, 'customer_group_id', data_get($customer, 'group.id'));
+        if (is_numeric($customerGroupId)) {
+            $payload['customer_group_id'] = (int) $customerGroupId;
+        }
+
+        [$updateBody, $updateStatus] = $this->request(
+            $baseUrl . '/api/admin/customers/' . $customerId,
+            'PUT',
+            $headers + ['Content-Type' => 'application/json'],
+            json_encode($payload, JSON_THROW_ON_ERROR)
+        );
+
+        if ($updateStatus < 200 || $updateStatus >= 300) {
+            Log::error('Bagisto customer phone update failed', [
+                'email' => $email,
+                'customer_id' => $customerId,
+                'status' => $updateStatus,
+                'body' => $this->truncate($updateBody),
+            ]);
+            $this->warn(sprintf(
+                '%s: phone update returned HTTP %d (%s).',
+                $email,
+                $updateStatus,
+                $this->truncate($updateBody)
+            ));
+
+            return false;
+        }
+
+        Log::info('Ghost Laser customer phone normalized in Bagisto.', [
+            'email' => $email,
+            'customer_id' => $customerId,
+            'phone' => $normalized,
+        ]);
+
+        return true;
     }
 
     /**
@@ -343,7 +512,7 @@ class SyncGhostLaserCustomers extends Command
             'state' => trim((string) ($customer['state'] ?? '')),
             'postcode' => trim((string) ($customer['zip'] ?? '')),
             'country' => $country,
-            'phone' => trim((string) ($customer['phone'] ?? '')),
+            'phone' => $this->normalizePhone((string) ($customer['phone'] ?? '')),
         ];
 
         // Bagisto validates all of these as required, so an incomplete source
