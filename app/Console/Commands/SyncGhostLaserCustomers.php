@@ -376,7 +376,7 @@ class SyncGhostLaserCustomers extends Command
      */
     private function normalizePhone(string $phone): string
     {
-        return trim(preg_replace('/[-\s()]/', '', $phone) ?? '');
+        return trim(preg_replace("/[-\s()\xC2\xA0]+/u", '', $phone) ?? '');
     }
 
     /**
@@ -413,6 +413,7 @@ class SyncGhostLaserCustomers extends Command
             throw new RuntimeException('Customer fetch returned an invalid data response.');
         }
 
+        // The admin API nests the customer under a "data" key.
         $customer = $response['data'] ?? $response;
         if (!is_array($customer)) {
             throw new RuntimeException('Customer fetch returned an invalid data response.');
@@ -425,22 +426,52 @@ class SyncGhostLaserCustomers extends Command
             return null;
         }
 
+        $firstName = trim((string) data_get($customer, 'first_name', ''));
+        $lastName = trim((string) data_get($customer, 'last_name', ''));
+        $customerEmail = trim((string) data_get($customer, 'email', ''));
+        $gender = trim((string) data_get($customer, 'gender', ''));
+        $customerGroupId = data_get($customer, 'customer_group_id', data_get($customer, 'group.id'));
+
+        $missing = [];
+        foreach ([
+            'first_name' => $firstName,
+            'last_name' => $lastName,
+            'email' => $customerEmail,
+            'gender' => $gender,
+        ] as $field => $value) {
+            if ($value === '') {
+                $missing[] = $field;
+            }
+        }
+
+        if (!is_numeric($customerGroupId)) {
+            $missing[] = 'customer_group_id';
+        }
+
+        if ($missing !== []) {
+            Log::warning('Bagisto customer missing required fields; phone backfill skipped.', [
+                'email' => $email,
+                'customer_id' => $customerId,
+                'missing' => $missing,
+            ]);
+            $this->warn(sprintf(
+                'Customer %d (%s): phone backfill skipped, missing %s.',
+                $customerId,
+                $email,
+                implode(', ', $missing)
+            ));
+
+            return null;
+        }
+
         $payload = [
-            'first_name' => (string) data_get($customer, 'first_name', ''),
-            'last_name' => (string) data_get($customer, 'last_name', ''),
-            'email' => (string) data_get($customer, 'email', $email),
+            'first_name' => $firstName,
+            'last_name' => $lastName,
+            'email' => $customerEmail,
+            'gender' => $gender,
+            'customer_group_id' => (int) $customerGroupId,
             'phone' => $normalized,
         ];
-
-        $gender = (string) data_get($customer, 'gender', '');
-        if ($gender !== '') {
-            $payload['gender'] = $gender;
-        }
-
-        $customerGroupId = data_get($customer, 'customer_group_id', data_get($customer, 'group.id'));
-        if (is_numeric($customerGroupId)) {
-            $payload['customer_group_id'] = (int) $customerGroupId;
-        }
 
         [$updateBody, $updateStatus] = $this->request(
             $baseUrl . '/api/admin/customers/' . $customerId,
